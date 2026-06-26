@@ -28,6 +28,12 @@ interface TokenCache {
 	refreshToken?: string;
 }
 
+interface CalendarInfo {
+	id: string;
+	name: string;
+	isDefault: boolean;
+}
+
 interface PluginSettings {
 	clientId: string;
 	tenantId: string;
@@ -37,6 +43,7 @@ interface PluginSettings {
 	sectionHeading: string;
 	skipAllDay: boolean;
 	skipPrivate: boolean;
+	selectedCalendarIds: string[]; // leer = alle Kalender
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -50,9 +57,10 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	sectionHeading: "Meetings",
 	skipAllDay: true,
 	skipPrivate: true,
+	selectedCalendarIds: [],
 };
 
-const REDIRECT_URI  = "obsidian://ms365-meetings/callback";
+const REDIRECT_URI  = "obsidian://ms365-meetings";
 const GRAPH_BASE    = "https://graph.microsoft.com/v1.0";
 const BLOCK_START   = (id: string) => `<!-- ms365-meeting:${id} -->`;
 const BLOCK_END_TAG = "<!-- ms365-meeting-end -->";
@@ -218,7 +226,28 @@ class MSAuthClient {
 class GraphCalendarClient {
 	constructor(private auth: MSAuthClient) {}
 
-	async getEventsForDate(dateStr: string): Promise<MeetingEvent[]> {
+	async getCalendars(): Promise<CalendarInfo[]> {
+		const token = await this.auth.getAccessToken();
+		const res = await fetch(
+			`${GRAPH_BASE}/me/calendars?$select=id,name,isDefaultCalendar&$top=50`,
+			{ headers: { Authorization: `Bearer ${token}` } }
+		);
+		if (!res.ok) throw new Error(`Graph calendars error ${res.status}`);
+		const data = await res.json() as { value: { id: string; name: string; isDefaultCalendar: boolean }[] };
+		return data.value.map(c => ({ id: c.id, name: c.name, isDefault: c.isDefaultCalendar }));
+	}
+
+	async getEventsForDate(dateStr: string, selectedCalendarIds: string[] = []): Promise<MeetingEvent[]> {
+		// Wenn bestimmte Kalender ausgewählt: pro Kalender einzeln abfragen und zusammenführen
+		if (selectedCalendarIds.length > 0) {
+			const results = await Promise.all(
+				selectedCalendarIds.map(id => this.getEventsForCalendar(id, dateStr))
+			);
+			const all = results.flat();
+			all.sort((a, b) => a.start.localeCompare(b.start));
+			return all;
+		}
+		// Sonst: alle Kalender via /me/calendarView
 		const token = await this.auth.getAccessToken();
 
 		// Build Vienna-aware time window
@@ -258,6 +287,33 @@ class GraphCalendarClient {
 				return true;
 			})
 			.map(this.mapEvent.bind(this));
+	}
+
+	private async getEventsForCalendar(calendarId: string, dateStr: string): Promise<MeetingEvent[]> {
+		const token = await this.auth.getAccessToken();
+		const viennaOffset = this.getViennaOffset(new Date(`${dateStr}T12:00:00`));
+		const startUtc = new Date(`${dateStr}T00:00:00${viennaOffset}`).toISOString();
+		const endUtc   = new Date(`${dateStr}T23:59:59${viennaOffset}`).toISOString();
+
+		const params = new URLSearchParams({
+			startDateTime: startUtc,
+			endDateTime:   endUtc,
+			$select: "id,subject,start,end,isAllDay,isCancelled,attendees,onlineMeeting,location,sensitivity",
+			$top: "50",
+		});
+
+		const res = await fetch(
+			`${GRAPH_BASE}/me/calendars/${calendarId}/calendarView?${params}`,
+			{
+				headers: {
+					Authorization: `Bearer ${token}`,
+					Prefer: `outlook.timezone="Europe/Vienna"`,
+				},
+			}
+		);
+		if (!res.ok) return [];
+		const data = await res.json() as { value: GraphEvent[] };
+		return data.value.map(this.mapEvent.bind(this));
 	}
 
 	private getViennaOffset(date: Date): string {
@@ -422,8 +478,8 @@ interface PluginData {
 
 export default class MS365MeetingsPlugin extends Plugin {
 	settings!: PluginSettings;
-	private auth!: MSAuthClient;
-	private graph!: GraphCalendarClient;
+	auth!: MSAuthClient;
+	graph!: GraphCalendarClient;
 	private writer!: DailyNoteWriter;
 	private pollTimer: number | null = null;
 	private pluginData: PluginData = { settings: DEFAULT_SETTINGS, tokenCache: null };
@@ -436,9 +492,10 @@ export default class MS365MeetingsPlugin extends Plugin {
 		this.graph = new GraphCalendarClient(this.auth);
 		this.writer = new DailyNoteWriter(this.settings);
 
-		// Handle OAuth callback: obsidian://ms365-meetings/callback?code=...
+		// Handle OAuth callback: obsidian://ms365-meetings?code=...
+		// Obsidian protocol handler unterstützt keinen Slash nach der Action.
 		this.registerObsidianProtocolHandler("ms365-meetings", async (params) => {
-			if (params.action === "callback" && params.code) {
+			if (params.code) {
 				await this.auth.handleCallback(params.code);
 				new Notice("✅ Microsoft-Anmeldung erfolgreich");
 			}
@@ -508,7 +565,7 @@ export default class MS365MeetingsPlugin extends Plugin {
 	async updateDailyNote(file: TFile, dateStr?: string) {
 		const date = dateStr ?? file.basename.substring(0, 10);
 		try {
-			const events = await this.graph.getEventsForDate(date);
+			const events = await this.graph.getEventsForDate(date, this.settings.selectedCalendarIds);
 			const content = await this.app.vault.read(file);
 			const updated = this.writer.mergeIntoNote(content, events, this.settings);
 			if (updated !== content) {
@@ -555,6 +612,8 @@ export default class MS365MeetingsPlugin extends Plugin {
 // ─── Settings Tab ─────────────────────────────────────────────────────────────
 
 class MS365MeetingsSettingTab extends PluginSettingTab {
+	private calendars: CalendarInfo[] = [];
+
 	constructor(app: App, private plugin: MS365MeetingsPlugin) {
 		super(app, plugin);
 	}
@@ -564,8 +623,56 @@ class MS365MeetingsSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "MS365 Meetings" });
 
+		// ── Anmeldung ──────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Anmeldung" });
+
 		new Setting(containerEl)
-			.setName("Daily Note Ordner")
+			.setName("Mit Microsoft 365 anmelden")
+			.setDesc("Einmalig anmelden — Token wird gespeichert.")
+			.addButton(b => b
+				.setButtonText("Anmelden")
+				.onClick(async () => {
+					try {
+						await this.plugin.auth.startAuthFlow();
+						new Notice("✅ Anmeldung erfolgreich");
+						// Kalender nach Anmeldung laden
+						this.loadCalendars(containerEl);
+					} catch (e) {
+						new Notice(`Fehler: ${e}`);
+					}
+				}));
+
+		// ── Kalender ───────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Kalender" });
+
+		const calSection = containerEl.createDiv();
+		this.renderCalendarSection(calSection);
+
+		new Setting(containerEl)
+			.setName("Kalender aktualisieren")
+			.setDesc("Kalenderliste neu laden")
+			.addButton(b => b
+				.setButtonText("Laden")
+				.onClick(() => this.loadCalendars(calSection)));
+
+		// ── Termine ────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Termine" });
+
+		new Setting(containerEl)
+			.setName("Ganztägige Termine anzeigen")
+			.setDesc("Ganztägige Events (z.B. Urlaub) in der Daily Note ein- oder ausblenden")
+			.addToggle(t => t
+				.setValue(!this.plugin.settings.skipAllDay)
+				.onChange(async v => {
+					this.plugin.settings.skipAllDay = !v;
+					await this.plugin.saveSettings();
+				}));
+
+		// ── Daily Note ─────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Daily Note" });
+
+		new Setting(containerEl)
+			.setName("Ordner")
 			.setDesc("Relativer Pfad im Vault, z.B. 01_daily")
 			.addText(t => t
 				.setValue(this.plugin.settings.dailyNoteFolder)
@@ -573,7 +680,7 @@ class MS365MeetingsSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Datumsformat")
-			.setDesc("Format der Daily Note Dateinamen, z.B. YYYY-MM-DD")
+			.setDesc("Format der Dateinamen, z.B. YYYY-MM-DD")
 			.addText(t => t
 				.setValue(this.plugin.settings.dailyNoteDateFormat)
 				.onChange(async v => { this.plugin.settings.dailyNoteDateFormat = v; await this.plugin.saveSettings(); }));
@@ -587,31 +694,65 @@ class MS365MeetingsSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Poll-Intervall (Minuten)")
-			.setDesc("Wie oft Termine aktualisiert werden")
+			.setDesc("Wie oft Termine automatisch aktualisiert werden")
 			.addSlider(s => s
 				.setLimits(5, 60, 5)
 				.setValue(this.plugin.settings.pollIntervalMinutes)
 				.setDynamicTooltip()
 				.onChange(async v => { this.plugin.settings.pollIntervalMinutes = v; await this.plugin.saveSettings(); }));
+	}
 
-		new Setting(containerEl)
-			.setName("Ganztägige Termine überspringen")
-			.addToggle(t => t
-				.setValue(this.plugin.settings.skipAllDay)
-				.onChange(async v => { this.plugin.settings.skipAllDay = v; await this.plugin.saveSettings(); }));
+	private renderCalendarSection(container: HTMLElement) {
+		container.empty();
+		if (this.calendars.length === 0) {
+			container.createEl("p", {
+				text: "Noch keine Kalender geladen. Zuerst anmelden, dann 'Laden' klicken.",
+				cls: "setting-item-description",
+			});
+			return;
+		}
 
-		new Setting(containerEl)
-			.setName("Anmeldung")
-			.setDesc("Mit Microsoft 365 anmelden")
-			.addButton(b => b
-				.setButtonText("Anmelden")
-				.onClick(async () => {
-					try {
-						await this.plugin.auth.startAuthFlow();
-						new Notice("✅ Anmeldung erfolgreich");
-					} catch (e) {
-						new Notice(`Fehler: ${e}`);
-					}
-				}));
+		const selected = new Set(this.plugin.settings.selectedCalendarIds);
+
+		container.createEl("p", {
+			text: selected.size === 0
+				? "Alle Kalender werden synchronisiert."
+				: `${selected.size} Kalender ausgewählt.`,
+			cls: "setting-item-description",
+		});
+
+		for (const cal of this.calendars) {
+			new Setting(container)
+				.setName(cal.name + (cal.isDefault ? " ★" : ""))
+				.addToggle(t => t
+					.setValue(selected.size === 0 || selected.has(cal.id))
+					.onChange(async (on) => {
+						// Wenn alle an waren (leeres Array) und einer wird abgewählt:
+						// alle anderen explizit aktivieren
+						const cur = new Set(this.plugin.settings.selectedCalendarIds);
+						if (cur.size === 0) {
+							// Fülle mit allen außer diesem
+							this.calendars.forEach(c => { if (c.id !== cal.id) cur.add(c.id); });
+						} else if (on) {
+							cur.add(cal.id);
+						} else {
+							cur.delete(cal.id);
+						}
+						// Wenn alle aktiv: zurück zu leerem Array (= alle)
+						if (cur.size === this.calendars.length) cur.clear();
+						this.plugin.settings.selectedCalendarIds = Array.from(cur);
+						await this.plugin.saveSettings();
+						this.renderCalendarSection(container);
+					}));
+		}
+	}
+
+	private async loadCalendars(container: HTMLElement) {
+		try {
+			this.calendars = await this.plugin.graph.getCalendars();
+			this.renderCalendarSection(container);
+		} catch (e) {
+			new Notice(`Kalender laden fehlgeschlagen: ${e}`);
+		}
 	}
 }
