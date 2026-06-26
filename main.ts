@@ -7,6 +7,8 @@ import {
 	TFile,
 	moment,
 } from "obsidian";
+import * as http from "http";
+import * as net from "net";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -60,7 +62,11 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	selectedCalendarIds: [],
 };
 
-const REDIRECT_URI  = "obsidian://ms365-meetings";
+// Redirect URI: lokaler HTTP-Server, Port wird dynamisch gewählt
+// Microsoft erlaubt http://localhost ohne spezifischen Port in Public Client Apps
+function buildRedirectUri(port: number): string {
+	return `http://localhost:${port}`;
+}
 const GRAPH_BASE    = "https://graph.microsoft.com/v1.0";
 const BLOCK_START   = (id: string) => `<!-- ms365-meeting:${id} -->`;
 const BLOCK_END_TAG = "<!-- ms365-meeting-end -->";
@@ -71,8 +77,6 @@ const SECTION_END   = "<!-- ms365-meetings-section-end -->";
 
 class MSAuthClient {
 	private cache: TokenCache | null = null;
-	private codeVerifier = "";
-	private pendingResolve: ((code: string) => void) | null = null;
 
 	constructor(
 		private clientId: string,
@@ -100,21 +104,13 @@ class MSAuthClient {
 	}
 
 	async getAccessToken(): Promise<string> {
-		// Return cached token if still valid (5 min buffer)
 		if (this.cache && Date.now() < this.cache.expiresAt - 300_000) {
 			return this.cache.accessToken;
 		}
-
-		// Try refresh
 		if (this.cache?.refreshToken) {
-			try {
-				return await this.refreshAccessToken(this.cache.refreshToken);
-			} catch {
-				this.cache = null;
-			}
+			try { return await this.refreshAccessToken(this.cache.refreshToken); }
+			catch { this.cache = null; }
 		}
-
-		// Full auth flow
 		return await this.startAuthFlow();
 	}
 
@@ -125,13 +121,11 @@ class MSAuthClient {
 			refresh_token: refreshToken,
 			scope: "Calendars.Read offline_access",
 		});
-
 		const res = await fetch(this.tokenUrl(), {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: body.toString(),
 		});
-
 		if (!res.ok) throw new Error("Refresh failed");
 		const data = await res.json() as { access_token: string; expires_in: number; refresh_token?: string };
 		this.saveToken(data);
@@ -144,18 +138,20 @@ class MSAuthClient {
 			expiresAt: Date.now() + data.expires_in * 1000,
 			refreshToken: data.refresh_token,
 		};
-		// Persist encrypted in plugin data
 		this.plugin.savePluginData({ tokenCache: this.cache });
 	}
 
 	async startAuthFlow(): Promise<string> {
 		const { verifier, challenge } = await this.generatePKCE();
-		this.codeVerifier = verifier;
+
+		// Starte lokalen HTTP-Server auf einem freien Port
+		const { port, waitForCode, closeServer } = await this.startLocalServer();
+		const redirectUri = buildRedirectUri(port);
 
 		const params = new URLSearchParams({
 			client_id: this.clientId,
 			response_type: "code",
-			redirect_uri: REDIRECT_URI,
+			redirect_uri: redirectUri,
 			scope: "Calendars.Read offline_access",
 			code_challenge: challenge,
 			code_challenge_method: "S256",
@@ -163,40 +159,73 @@ class MSAuthClient {
 		});
 
 		const authUrl = `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/authorize?${params}`;
-
-		// Open browser
 		window.open(authUrl);
 		new Notice("Browser geöffnet — bitte mit Microsoft anmelden. Das Fenster schließt sich automatisch.", 10000);
 
-		// Wait for redirect callback
-		return new Promise((resolve, reject) => {
-			this.pendingResolve = async (code: string) => {
-				try {
-					const token = await this.exchangeCode(code);
-					resolve(token);
-				} catch (e) {
-					reject(e);
-				}
-			};
-			// Timeout after 5 min
-			setTimeout(() => reject(new Error("Auth timeout")), 300_000);
-		});
-	}
-
-	async handleCallback(code: string): Promise<void> {
-		if (this.pendingResolve) {
-			this.pendingResolve(code);
-			this.pendingResolve = null;
+		try {
+			const code = await waitForCode();
+			return await this.exchangeCode(code, redirectUri, verifier);
+		} finally {
+			closeServer();
 		}
 	}
 
-	private async exchangeCode(code: string): Promise<string> {
+	private startLocalServer(): Promise<{
+		port: number;
+		waitForCode: () => Promise<string>;
+		closeServer: () => void;
+	}> {
+		return new Promise((resolve) => {
+			let resolveCode: (code: string) => void;
+			let rejectCode: (e: Error) => void;
+			const codePromise = new Promise<string>((res, rej) => {
+				resolveCode = res;
+				rejectCode = rej;
+			});
+
+			const server = http.createServer((req, res) => {
+				const url = new URL(req.url ?? "/", `http://localhost`);
+				const code = url.searchParams.get("code");
+				const error = url.searchParams.get("error");
+
+				if (code) {
+					res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+					res.end("<html><body style='font-family:sans-serif;padding:2em'><h2>✅ Anmeldung erfolgreich</h2><p>Du kannst dieses Fenster schließen und zu Obsidian zurückkehren.</p></body></html>");
+					resolveCode(code);
+				} else if (error) {
+					res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+					res.end(`<html><body><h2>Fehler: ${error}</h2></body></html>`);
+					rejectCode(new Error(`Auth error: ${error}`));
+				} else {
+					res.writeHead(404);
+					res.end();
+				}
+			});
+
+			// Timeout: 5 Minuten
+			const timeout = setTimeout(() => {
+				rejectCode(new Error("Auth timeout nach 5 Minuten"));
+				server.close();
+			}, 300_000);
+
+			server.listen(0, "localhost", () => {
+				const addr = server.address() as net.AddressInfo;
+				resolve({
+					port: addr.port,
+					waitForCode: () => codePromise.finally(() => clearTimeout(timeout)),
+					closeServer: () => server.close(),
+				});
+			});
+		});
+	}
+
+	private async exchangeCode(code: string, redirectUri: string, verifier: string): Promise<string> {
 		const body = new URLSearchParams({
 			client_id: this.clientId,
 			grant_type: "authorization_code",
 			code,
-			redirect_uri: REDIRECT_URI,
-			code_verifier: this.codeVerifier,
+			redirect_uri: redirectUri,
+			code_verifier: verifier,
 			scope: "Calendars.Read offline_access",
 		});
 
@@ -491,15 +520,6 @@ export default class MS365MeetingsPlugin extends Plugin {
 		this.auth.restoreCache(this.pluginData.tokenCache);
 		this.graph = new GraphCalendarClient(this.auth);
 		this.writer = new DailyNoteWriter(this.settings);
-
-		// Handle OAuth callback: obsidian://ms365-meetings?code=...
-		// Obsidian protocol handler unterstützt keinen Slash nach der Action.
-		this.registerObsidianProtocolHandler("ms365-meetings", async (params) => {
-			if (params.code) {
-				await this.auth.handleCallback(params.code);
-				new Notice("✅ Microsoft-Anmeldung erfolgreich");
-			}
-		});
 
 		// Update wenn Daily Note geöffnet wird
 		this.registerEvent(
