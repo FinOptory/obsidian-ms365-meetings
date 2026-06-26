@@ -466,6 +466,20 @@ class DailyNoteWriter {
 		return lines.join("\n");
 	}
 
+	private totalDuration(events: MeetingEvent[]): string {
+		let totalMin = 0;
+		for (const e of events) {
+			if (e.isAllDay) continue;
+			const [sh, sm] = e.start.substring(11, 16).split(":").map(Number);
+			const [eh, em] = e.end.substring(11, 16).split(":").map(Number);
+			const mins = (eh * 60 + em) - (sh * 60 + sm);
+			if (mins > 0) totalMin += mins;
+		}
+		const h = Math.floor(totalMin / 60);
+		const m = totalMin % 60;
+		return `${h}:${String(m).padStart(2, "0")}`;
+	}
+
 	mergeIntoNote(existingContent: string, events: MeetingEvent[], settings: PluginSettings): string {
 		// Bereinige alte Anker-Kommentare aus früheren Versionen
 		let content = existingContent
@@ -480,12 +494,14 @@ class DailyNoteWriter {
 
 		if (visible.length === 0) return content;
 
-		const h1 = MEETINGS_H1(settings.sectionHeading);
+		const duration = this.totalDuration(visible);
+		const h1 = `# ${settings.sectionHeading} (${duration})`;
 		const blocks = visible.map(e => this.buildBlock(e, existingNotes)).join("\n\n");
 		const section = `${h1}\n\n${blocks}\n`;
 
 		// Ersetze bestehenden H1-Block oder hänge an
-		const h1Re = new RegExp(`^# ${settings.sectionHeading}\\s*\\n[\\s\\S]*?(?=^# |\\Z)`, "m");
+		// Matcht "# Meetings" und optional "(6:30)" dahinter
+		const h1Re = new RegExp(`^# ${settings.sectionHeading}[^\\n]*\\n[\\s\\S]*?(?=^# |\\Z)`, "m");
 		if (h1Re.test(content)) {
 			return content.replace(h1Re, section);
 		}
