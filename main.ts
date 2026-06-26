@@ -23,6 +23,7 @@ interface MeetingEvent {
 	joinUrl?: string;    // Teams/Zoom link
 	location?: string;
 	isAllDay: boolean;
+	showAs: string;      // busy | free | tentative | oof | workingElsewhere
 }
 
 interface TokenCache {
@@ -388,6 +389,7 @@ class GraphCalendarClient {
 			joinUrl: e.onlineMeeting?.joinUrl,
 			location: e.location?.displayName,
 			isAllDay: e.isAllDay ?? false,
+			showAs: e.showAs ?? "busy",
 		};
 	}
 }
@@ -467,14 +469,31 @@ class DailyNoteWriter {
 	}
 
 	private totalDuration(events: MeetingEvent[]): string {
+		// Nur showAs=busy, Union-Merge für Überlappungen
+		const intervals: [number, number][] = events
+			.filter(e => !e.isAllDay && e.showAs === "busy" && !e.isCancelled)
+			.map(e => {
+				const [sh, sm] = e.start.substring(11, 16).split(":").map(Number);
+				const [eh, em] = e.end.substring(11, 16).split(":").map(Number);
+				return [sh * 60 + sm, eh * 60 + em] as [number, number];
+			})
+			.filter(([s, e]) => e > s)
+			.sort((a, b) => a[0] - b[0]);
+
+		if (!intervals.length) return "0:00";
+
 		let totalMin = 0;
-		for (const e of events) {
-			if (e.isAllDay) continue;
-			const [sh, sm] = e.start.substring(11, 16).split(":").map(Number);
-			const [eh, em] = e.end.substring(11, 16).split(":").map(Number);
-			const mins = (eh * 60 + em) - (sh * 60 + sm);
-			if (mins > 0) totalMin += mins;
+		let cur = intervals[0];
+		for (let i = 1; i < intervals.length; i++) {
+			if (intervals[i][0] < cur[1]) {
+				cur = [cur[0], Math.max(cur[1], intervals[i][1])];
+			} else {
+				totalMin += cur[1] - cur[0];
+				cur = intervals[i];
+			}
 		}
+		totalMin += cur[1] - cur[0];
+
 		const h = Math.floor(totalMin / 60);
 		const m = totalMin % 60;
 		return `${h}:${String(m).padStart(2, "0")}`;
