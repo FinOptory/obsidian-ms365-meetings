@@ -8,6 +8,7 @@ import {
 	moment,
 } from "obsidian";
 import * as http from "http";
+import * as https from "https";
 import * as net from "net";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ interface PluginSettings {
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	clientId: "aa4ae0d0-02b3-4a4a-8859-f99395bb753d",
-	tenantId: "common",
+	tenantId: "organizations",
 	dailyNoteFolder: "01_daily",
 	dailyNoteDateFormat: "YYYY-MM-DD",
 	pollIntervalMinutes: 15,
@@ -68,10 +69,11 @@ function buildRedirectUri(port: number): string {
 	return `http://localhost:${port}`;
 }
 const GRAPH_BASE    = "https://graph.microsoft.com/v1.0";
-const BLOCK_START   = (id: string) => `<!-- ms365-meeting:${id} -->`;
-const BLOCK_END_TAG = "<!-- ms365-meeting-end -->";
-const SECTION_START = "<!-- ms365-meetings-section -->";
-const SECTION_END   = "<!-- ms365-meetings-section-end -->";
+// %% %% ist Obsidian-native Kommentar-Syntax — in Reading View unsichtbar
+const BLOCK_START   = (id: string) => `%% ms365-meeting:${id} %%`;
+const BLOCK_END_TAG = "%% ms365-meeting-end %%";
+const SECTION_START = "%% ms365-meetings-section %%";
+const SECTION_END   = "%% ms365-meetings-section-end %%";
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
@@ -103,6 +105,33 @@ class MSAuthClient {
 		return `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/token`;
 	}
 
+	// Node.js HTTPS statt window.fetch — vermeidet Origin: app://obsidian.md Header
+	private nodePost(url: string, body: string): Promise<Record<string, unknown>> {
+		return new Promise((resolve, reject) => {
+			const urlObj = new URL(url);
+			const bodyBuf = Buffer.from(body, "utf-8");
+			const req = https.request({
+				hostname: urlObj.hostname,
+				path: urlObj.pathname + urlObj.search,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/x-www-form-urlencoded",
+					"Content-Length": bodyBuf.byteLength,
+				},
+			}, (res) => {
+				let data = "";
+				res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+				res.on("end", () => {
+					try { resolve(JSON.parse(data)); }
+					catch { reject(new Error(`Invalid JSON: ${data.substring(0, 200)}`)); }
+				});
+			});
+			req.on("error", reject);
+			req.write(bodyBuf);
+			req.end();
+		});
+	}
+
 	async getAccessToken(): Promise<string> {
 		if (this.cache && Date.now() < this.cache.expiresAt - 300_000) {
 			return this.cache.accessToken;
@@ -111,7 +140,13 @@ class MSAuthClient {
 			try { return await this.refreshAccessToken(this.cache.refreshToken); }
 			catch { this.cache = null; }
 		}
-		return await this.startAuthFlow();
+		// Kein automatischer Auth-Flow — nur explizit via Settings "Anmelden"
+		throw new Error("Not authenticated");
+	}
+
+	isAuthenticated(): boolean {
+		return !!(this.cache?.accessToken && Date.now() < this.cache.expiresAt - 300_000)
+			|| !!(this.cache?.refreshToken);
 	}
 
 	private async refreshAccessToken(refreshToken: string): Promise<string> {
@@ -121,13 +156,8 @@ class MSAuthClient {
 			refresh_token: refreshToken,
 			scope: "Calendars.Read offline_access",
 		});
-		const res = await fetch(this.tokenUrl(), {
-			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
-			body: body.toString(),
-		});
-		if (!res.ok) throw new Error("Refresh failed");
-		const data = await res.json() as { access_token: string; expires_in: number; refresh_token?: string };
+		const data = await this.nodePost(this.tokenUrl(), body.toString()) as { access_token: string; expires_in: number; refresh_token?: string; error?: string };
+		if (data.error) throw new Error(`Refresh failed: ${data.error}`);
 		this.saveToken(data);
 		return data.access_token;
 	}
@@ -228,19 +258,8 @@ class MSAuthClient {
 			code_verifier: verifier,
 			scope: "Calendars.Read offline_access",
 		});
-
-		const res = await fetch(this.tokenUrl(), {
-			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
-			body: body.toString(),
-		});
-
-		if (!res.ok) {
-			const err = await res.text();
-			throw new Error(`Token exchange failed: ${err}`);
-		}
-
-		const data = await res.json() as { access_token: string; expires_in: number; refresh_token?: string };
+		const data = await this.nodePost(this.tokenUrl(), body.toString()) as { access_token: string; expires_in: number; refresh_token?: string; error?: string; error_description?: string };
+		if (data.error) throw new Error(`Token exchange failed: ${data.error_description || data.error}`);
 		this.saveToken(data);
 		return data.access_token;
 	}
@@ -472,7 +491,7 @@ class DailyNoteWriter {
 		// Ersetze bestehende Sektion oder füge am Ende an
 		if (existingContent.includes(SECTION_START)) {
 			return existingContent.replace(
-				new RegExp(`${SECTION_START}[\\s\\S]*?${SECTION_END}`),
+				/%% ms365-meetings-section %%[\s\S]*?%% ms365-meetings-section-end %%/,
 				section
 			);
 		}
@@ -482,7 +501,7 @@ class DailyNoteWriter {
 
 	private extractExistingNotes(content: string): Map<string, string> {
 		const notes = new Map<string, string>();
-		const blockRe = /<!-- ms365-meeting:([^>]+) -->([\s\S]*?)<!-- ms365-meeting-end -->/g;
+		const blockRe = /%% ms365-meeting:([^%]+) %%([\s\S]*?)%% ms365-meeting-end %%/g;
 
 		let match;
 		while ((match = blockRe.exec(content)) !== null) {
@@ -521,10 +540,10 @@ export default class MS365MeetingsPlugin extends Plugin {
 		this.graph = new GraphCalendarClient(this.auth);
 		this.writer = new DailyNoteWriter(this.settings);
 
-		// Update wenn Daily Note geöffnet wird
+		// Update wenn Daily Note geöffnet wird — nur wenn eingeloggt
 		this.registerEvent(
 			this.app.workspace.on("file-open", async (file) => {
-				if (file && this.isDailyNote(file)) {
+				if (file && this.isDailyNote(file) && this.auth.isAuthenticated()) {
 					await this.updateDailyNote(file);
 				}
 			})
@@ -586,7 +605,9 @@ export default class MS365MeetingsPlugin extends Plugin {
 		const date = dateStr ?? file.basename.substring(0, 10);
 		try {
 			const events = await this.graph.getEventsForDate(date, this.settings.selectedCalendarIds);
-			const content = await this.app.vault.read(file);
+			let content = await this.app.vault.read(file);
+			// Migration: alte HTML-Kommentar-Syntax entfernen
+			content = content.replace(/<!-- ms365-meetings-section -->[\s\S]*?<!-- ms365-meetings-section-end -->/g, "");
 			const updated = this.writer.mergeIntoNote(content, events, this.settings);
 			if (updated !== content) {
 				await this.app.vault.modify(file, updated);
@@ -603,7 +624,7 @@ export default class MS365MeetingsPlugin extends Plugin {
 		if (this.pollTimer) window.clearInterval(this.pollTimer);
 		const ms = this.settings.pollIntervalMinutes * 60 * 1000;
 		this.pollTimer = window.setInterval(async () => {
-			// Update heute's Daily Note wenn offen
+			if (!this.auth.isAuthenticated()) return;
 			const active = this.app.workspace.getActiveFile();
 			if (active && this.isDailyNote(active)) {
 				await this.updateDailyNote(active);
@@ -615,6 +636,9 @@ export default class MS365MeetingsPlugin extends Plugin {
 		const raw = await this.loadData() as PluginData | null;
 		this.pluginData = Object.assign({ settings: DEFAULT_SETTINGS, tokenCache: null }, raw ?? {});
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, this.pluginData.settings);
+		// tenantId + clientId immer aus DEFAULT_SETTINGS — nie aus altem Cache
+		this.settings.tenantId = DEFAULT_SETTINGS.tenantId;
+		this.settings.clientId = DEFAULT_SETTINGS.clientId;
 	}
 
 	async saveSettings() {
@@ -646,27 +670,35 @@ class MS365MeetingsSettingTab extends PluginSettingTab {
 		// ── Anmeldung ──────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Anmeldung" });
 
+		const isLoggedIn = this.plugin.auth.isAuthenticated();
 		new Setting(containerEl)
-			.setName("Mit Microsoft 365 anmelden")
-			.setDesc("Einmalig anmelden — Token wird gespeichert.")
-			.addButton(b => b
-				.setButtonText("Anmelden")
-				.onClick(async () => {
+			.setName("Microsoft 365")
+			.setDesc(isLoggedIn ? "✅ Angemeldet" : "Noch nicht angemeldet — Token wird nach Anmeldung gespeichert.")
+			.addButton(b => {
+				b.setButtonText(isLoggedIn ? "Neu anmelden" : "Anmelden");
+				if (!isLoggedIn) b.setCta();
+				b.onClick(async () => {
 					try {
 						await this.plugin.auth.startAuthFlow();
 						new Notice("✅ Anmeldung erfolgreich");
-						// Kalender nach Anmeldung laden
-						this.loadCalendars(containerEl);
+						this.calendars = []; // Reset damit auto-load greift
+						this.display();
 					} catch (e) {
 						new Notice(`Fehler: ${e}`);
 					}
-				}));
+				});
+			});
 
 		// ── Kalender ───────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Kalender" });
 
 		const calSection = containerEl.createDiv();
 		this.renderCalendarSection(calSection);
+
+		// Kalender automatisch laden wenn eingeloggt und noch nicht geladen
+		if (this.plugin.auth.isAuthenticated() && this.calendars.length === 0) {
+			this.loadCalendars(calSection);
+		}
 
 		new Setting(containerEl)
 			.setName("Kalender aktualisieren")
