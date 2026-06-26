@@ -2,9 +2,10 @@
   "id": "ms365-meetings",
   "name": "MS365 Meetings",
   "version": "0.1.0",
-  "minAppVersion": "1.0.0",
-  "description": "Bringt M365-Kalendertermine strukturiert in die Daily Note — mit Notizen-Persistenz, Absage-Erkennung und automatischen Updates.",
+  "minAppVersion": "1.4.0",
+  "description": "Pulls your Microsoft 365 calendar events into Daily Notes — with attendees, Teams links, note-taking sections, and meeting load tracking.",
   "author": "Green Dopamine GmbH",
   "authorUrl": "https://green-dopamine.at",
+  "fundingUrl": "https://finoptory.ai",
   "isDesktopOnly": true
 }
