@@ -1,0 +1,5 @@
+/* MS365 Meetings Plugin */
+.ms365-meetings-cancelled {
+    text-decoration: line-through;
+    opacity: 0.6;
+}
