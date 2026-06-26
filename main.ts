@@ -69,11 +69,7 @@ function buildRedirectUri(port: number): string {
 	return `http://localhost:${port}`;
 }
 const GRAPH_BASE    = "https://graph.microsoft.com/v1.0";
-// %% %% ist Obsidian-native Kommentar-Syntax — in Reading View unsichtbar
-const BLOCK_START   = (id: string) => `%% ms365-meeting:${id} %%`;
-const BLOCK_END_TAG = "%% ms365-meeting-end %%";
-const SECTION_START = "%% ms365-meetings-section %%";
-const SECTION_END   = "%% ms365-meetings-section-end %%";
+const MEETINGS_H1 = (heading: string) => `# ${heading}`;
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
@@ -411,109 +407,89 @@ interface GraphEvent {
 }
 
 // ─── Daily Note Writer ────────────────────────────────────────────────────────
+// Kein Anker-Kommentar. Notizen-Persistenz via Zeit-Matching (HH:MM – HH:MM).
+// Der Meetings-Block wird durch den H1 "# Meetings" begrenzt.
 
 class DailyNoteWriter {
 	constructor(private settings: PluginSettings) {}
 
-	buildEventBlock(event: MeetingEvent): string {
-		const startTime = event.start.substring(11, 16);
-		const endTime   = event.end.substring(11, 16);
+	private timeKey(event: MeetingEvent): string {
+		return `${event.start.substring(11, 16)}–${event.end.substring(11, 16)}`;
+	}
 
-		// H2: Abgesagt mit Strikethrough
-		const titleLine = event.isCancelled
-			? `## ~~${event.subject}~~ [ABGESAGT] | ${startTime} – ${endTime}`
-			: `## ${event.subject} | ${startTime} – ${endTime}`;
+	// Extrahiert Notizen aus bestehenden Meeting-Blöcken anhand der Zeit.
+	private extractNotesByTime(content: string): Map<string, string> {
+		const notes = new Map<string, string>();
+		// Suche: ## Irgendwas | HH:MM – HH:MM ... _Notizen:_ \n <inhalt> \n bis zum nächsten ## oder EOF
+		const blockRe = /^## .+?\| (\d{2}:\d{2}) – (\d{2}:\d{2})[\s\S]*?_Notizen:_\n([\s\S]*?)(?=^## |\Z)/gm;
+		let match;
+		while ((match = blockRe.exec(content)) !== null) {
+			const key = `${match[1]}–${match[2]}`;
+			const noteText = match[3].replace(/\n+$/, "").trim();
+			if (noteText) notes.set(key, noteText);
+		}
+		return notes;
+	}
 
-		// Teilnehmer-Zeile
-		const maxShow = 4;
-		let attendeeLine = "";
+	private buildBlock(event: MeetingEvent, existingNotes: Map<string, string>): string {
+		const start = event.start.substring(11, 16);
+		const end   = event.end.substring(11, 16);
+
+		const header = event.isCancelled
+			? `## ~~${event.subject}~~ [ABGESAGT] | ${start} – ${end}`
+			: `## ${event.subject} | ${start} – ${end}`;
+
+		const lines: string[] = [header];
+
 		if (event.attendees.length > 0) {
-			const shown = event.attendees.slice(0, maxShow);
-			const rest  = event.attendees.length - maxShow;
-			attendeeLine = `Teilnehmer: ${shown.join(", ")}${rest > 0 ? `, +${rest}` : ""}`;
+			const shown = event.attendees.slice(0, 4);
+			const rest  = event.attendees.length - 4;
+			lines.push(`Teilnehmer: ${shown.join(", ")}${rest > 0 ? `, +${rest}` : ""}`);
 		}
 
-		// Link
-		const linkLine = event.joinUrl
-			? `[Meeting beitreten](${event.joinUrl})`
-			: event.location
-				? `Ort: ${event.location}`
-				: "";
+		if (event.joinUrl) {
+			lines.push(`[Meeting beitreten](${event.joinUrl})`);
+		} else if (event.location) {
+			lines.push(`Ort: ${event.location}`);
+		}
 
-		const lines = [
-			BLOCK_START(event.id),
-			titleLine,
-		];
-		if (attendeeLine) lines.push(attendeeLine);
-		if (linkLine) lines.push(linkLine);
 		lines.push("");
 		lines.push("_Notizen:_");
-		lines.push("");
-		lines.push(BLOCK_END_TAG);
+
+		const savedNotes = existingNotes.get(this.timeKey(event));
+		if (savedNotes) {
+			lines.push(savedNotes);
+		} else {
+			lines.push("");
+		}
 
 		return lines.join("\n");
 	}
 
-	/**
-	 * Merged neue Events in bestehende Daily Note.
-	 * Bestehende Notizen bleiben erhalten.
-	 */
 	mergeIntoNote(existingContent: string, events: MeetingEvent[], settings: PluginSettings): string {
-		// Baue Map: event-id → existierende Notizen
-		const existingNotes = this.extractExistingNotes(existingContent);
+		// Bereinige alte Anker-Kommentare aus früheren Versionen
+		let content = existingContent
+			.replace(/<!-- ms365-meetings-section -->[\s\S]*?<!-- ms365-meetings-section-end -->\n?/g, "")
+			.replace(/%% ms365-meetings-section %%[\s\S]*?%% ms365-meetings-section-end %%\n?/g, "");
 
-		// Baue neue Meetings-Sektion
-		const heading = `# ${settings.sectionHeading}`;
-		const eventBlocks = events
+		const existingNotes = this.extractNotesByTime(content);
+
+		const visible = events
 			.filter(e => !(e.isAllDay && settings.skipAllDay))
-			.sort((a, b) => a.start.localeCompare(b.start))
-			.map(e => {
-				const block = this.buildEventBlock(e);
-				// Preserve existing notes
-				const savedNotes = existingNotes.get(e.id);
-				if (savedNotes) {
-					return block.replace(
-						"_Notizen:_\n\n" + BLOCK_END_TAG,
-						`_Notizen:_\n${savedNotes}\n${BLOCK_END_TAG}`
-					);
-				}
-				return block;
-			});
+			.sort((a, b) => a.start.localeCompare(b.start));
 
-		const section = [
-			SECTION_START,
-			heading,
-			"",
-			...eventBlocks.flatMap(b => [b, ""]),
-			SECTION_END,
-		].join("\n");
+		if (visible.length === 0) return content;
 
-		// Ersetze bestehende Sektion oder füge am Ende an
-		if (existingContent.includes(SECTION_START)) {
-			return existingContent.replace(
-				/%% ms365-meetings-section %%[\s\S]*?%% ms365-meetings-section-end %%/,
-				section
-			);
+		const h1 = MEETINGS_H1(settings.sectionHeading);
+		const blocks = visible.map(e => this.buildBlock(e, existingNotes)).join("\n\n");
+		const section = `${h1}\n\n${blocks}\n`;
+
+		// Ersetze bestehenden H1-Block oder hänge an
+		const h1Re = new RegExp(`^# ${settings.sectionHeading}\\s*\\n[\\s\\S]*?(?=^# |\\Z)`, "m");
+		if (h1Re.test(content)) {
+			return content.replace(h1Re, section);
 		}
-
-		return `${existingContent.trimEnd()}\n\n${section}\n`;
-	}
-
-	private extractExistingNotes(content: string): Map<string, string> {
-		const notes = new Map<string, string>();
-		const blockRe = /%% ms365-meeting:([^%]+) %%([\s\S]*?)%% ms365-meeting-end %%/g;
-
-		let match;
-		while ((match = blockRe.exec(content)) !== null) {
-			const id = match[1];
-			const blockContent = match[2];
-			// Extract content between "_Notizen:_" and the end tag
-			const notesMatch = blockContent.match(/_Notizen:_\n([\s\S]*)/);
-			if (notesMatch && notesMatch[1].trim()) {
-				notes.set(id, notesMatch[1]);
-			}
-		}
-		return notes;
+		return `${content.trimEnd()}\n\n${section}`;
 	}
 }
 
@@ -605,9 +581,7 @@ export default class MS365MeetingsPlugin extends Plugin {
 		const date = dateStr ?? file.basename.substring(0, 10);
 		try {
 			const events = await this.graph.getEventsForDate(date, this.settings.selectedCalendarIds);
-			let content = await this.app.vault.read(file);
-			// Migration: alte HTML-Kommentar-Syntax entfernen
-			content = content.replace(/<!-- ms365-meetings-section -->[\s\S]*?<!-- ms365-meetings-section-end -->/g, "");
+			const content = await this.app.vault.read(file);
 			const updated = this.writer.mergeIntoNote(content, events, this.settings);
 			if (updated !== content) {
 				await this.app.vault.modify(file, updated);
